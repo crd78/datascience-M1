@@ -1,0 +1,25 @@
+{
+  "target": "failure_within_24h",
+  "rows": 24042,
+  "columns": 15,
+  "class_distribution": {
+    "0": 0.8519257965227518,
+    "1": 0.14807420347724815
+  },
+  "removed_as_leakage_for_failure_prediction": [
+    "failure_type",
+    "rul_hours",
+    "estimated_repair_cost"
+  ],
+  "identifier_columns_to_drop": [
+    "machine_id"
+  ],
+  "raw_low_signal_columns_to_monitor": [
+    "rpm",
+    "machine_id",
+    "pressure_level",
+    "ambient_temp"
+  ],
+  "outlier_strategy": "IQR clipping inside the numeric preprocessing pipeline, fitted only on train data.",
+  "lag_strategy": "Limited lags: lag_1 and lag_3 plus delta_1 and rolling_3_mean for selected sensor/process variables."
+}
