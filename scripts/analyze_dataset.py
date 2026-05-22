@@ -71,7 +71,7 @@ def main() -> None:
             if col != target and value < 0.03
         ],
         "outlier_strategy": "IQR clipping inside the numeric preprocessing pipeline, fitted only on train data.",
-        "lag_strategy": "Limited lags: lag_1 and lag_3 plus delta_1 and rolling_3_mean for selected sensor/process variables.",
+        "lag_strategy": "Limited lags: lag_1, lag_3, lag_6 and lag_12 plus delta_1 and rolling_3/rolling_6 means for selected sensor/process variables.",
     }
     (REPORTS_DIR / "data_quality_report.json").write_text(
         json.dumps(recommendations, indent=2),

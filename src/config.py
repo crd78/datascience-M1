@@ -8,6 +8,7 @@ REPORTS_DIR = PROJECT_ROOT / "reports"
 DEFAULT_DATA_PATH = DATA_DIR / "predictive_maintenance_v3.csv"
 
 DEFAULT_TARGET = "failure_within_24h"
+TARGET_HORIZON_HOURS = 24
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 
@@ -35,8 +36,8 @@ LAG_SOURCE_FEATURES = [
     "pressure_level",
 ]
 
-LAG_STEPS = [1, 3]
-ROLLING_WINDOWS = [3]
+LAG_STEPS = [1, 3, 6, 12]
+ROLLING_WINDOWS = [3, 6]
 
 BEST_MODEL_PATH = MODELS_DIR / "best_model.joblib"
 METRICS_CSV_PATH = REPORTS_DIR / "model_metrics.csv"

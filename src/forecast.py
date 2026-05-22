@@ -6,9 +6,19 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.config import DROP_IF_PRESENT
+from src.config import DROP_IF_PRESENT, TARGET_HORIZON_HOURS
 from src.data import add_temporal_features, clean_column_name
 from src.postprocessing import estimate_sampling_interval_minutes
+
+
+MODE_SENSOR_DRIFT_FACTORS = {
+    "idle": 0.0,
+    "normal": 1.0,
+    "peak": 2.5,
+}
+
+IDLE_MAX_RISK_INCREASE = 0.05
+PEAK_RISK_MULTIPLIER = 1.15
 
 
 def forecast_future_failures(
@@ -19,6 +29,8 @@ def forecast_future_failures(
     trend_window: int = 12,
     scenario: str = "stable_recent",
     trend_strength: float = 0.15,
+    future_mode: str | None = None,
+    mode_drift_strength: float = 0.03,
 ) -> pd.DataFrame:
     """Forecast future machine failure risk after the last observed timestamp.
 
@@ -30,6 +42,12 @@ def forecast_future_failures(
         raise ValueError("La prevision future exige une colonne timestamp.")
     if "machine_id" not in history_df.columns:
         raise ValueError("La prevision future exige une colonne machine_id.")
+    if horizon_hours > TARGET_HORIZON_HOURS:
+        raise ValueError(
+            f"Ce modele est entraine pour {TARGET_HORIZON_HOURS}h "
+            f"({artifact.get('target', 'target inconnue')}). "
+            f"Entraines un nouveau label pour demander {horizon_hours}h."
+        )
 
     history = history_df.copy()
     history.columns = [clean_column_name(col) for col in history.columns]
@@ -49,6 +67,8 @@ def forecast_future_failures(
         trend_window=trend_window,
         scenario=scenario,
         trend_strength=trend_strength,
+        future_mode=future_mode,
+        mode_drift_strength=mode_drift_strength,
     )
 
     if future_raw.empty:
@@ -57,17 +77,34 @@ def forecast_future_failures(
     combined = pd.concat([history, future_raw], ignore_index=True, sort=False)
     engineered = add_temporal_features(combined, artifact["target"])[0]
     future_engineered = engineered[engineered["is_future"] == True].copy()  # noqa: E712
+    history_engineered = engineered[~engineered["is_future"].eq(True)].copy()
 
     feature_columns = artifact["feature_columns"]
     for col in feature_columns:
         if col not in future_engineered.columns:
             future_engineered[col] = np.nan
+        if col not in history_engineered.columns:
+            history_engineered[col] = np.nan
 
     pipeline = artifact["pipeline"]
     future_engineered["predicted_failure"] = pipeline.predict(future_engineered[feature_columns])
     if hasattr(pipeline, "predict_proba"):
-        future_engineered["risk_probability"] = pipeline.predict_proba(future_engineered[feature_columns])[:, 1]
+        raw_future_risk = pipeline.predict_proba(future_engineered[feature_columns])[:, 1]
+        future_engineered["model_risk_probability"] = raw_future_risk
+
+        history_engineered["model_risk_probability"] = pipeline.predict_proba(history_engineered[feature_columns])[:, 1]
+        latest_history_risk = (
+            history_engineered.sort_values(["machine_id", "timestamp"])
+            .groupby("machine_id")
+            .tail(1)
+        )
+        current_risk_by_machine = latest_history_risk.set_index("machine_id")["model_risk_probability"].to_dict()
+        future_engineered["risk_probability"] = apply_mode_risk_adjustment(
+            future_engineered,
+            current_risk_by_machine,
+        )
     else:
+        future_engineered["model_risk_probability"] = future_engineered["predicted_failure"].astype(float)
         future_engineered["risk_probability"] = future_engineered["predicted_failure"].astype(float)
 
     return future_engineered.sort_values(["machine_id", "timestamp"]).reset_index(drop=True)
@@ -80,6 +117,8 @@ def build_future_raw_rows(
     trend_window: int,
     scenario: str = "stable_recent",
     trend_strength: float = 0.15,
+    future_mode: str | None = None,
+    mode_drift_strength: float = 0.03,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     numeric_cols = history_df.select_dtypes(include="number").columns.tolist()
@@ -104,11 +143,15 @@ def build_future_raw_rows(
     if scenario not in {"stable_recent", "damped_trend"}:
         raise ValueError("scenario doit etre 'stable_recent' ou 'damped_trend'.")
     trend_strength = float(np.clip(trend_strength, 0.0, 1.0))
+    mode_drift_strength = float(np.clip(mode_drift_strength, 0.0, 0.20))
+    mode_delta_profiles = build_mode_delta_profiles(history_df, numeric_cols)
 
     for machine_id, machine_df in history_df.groupby("machine_id", sort=False):
         machine_df = machine_df.sort_values("timestamp")
         last_row = machine_df.iloc[-1]
         last_timestamp = last_row["timestamp"]
+        projected_mode = future_mode if future_mode else last_row.get("operating_mode", "normal")
+        mode_drift_factor = get_mode_sensor_drift_factor(projected_mode)
 
         numeric_trends = {}
         numeric_baselines = {}
@@ -123,7 +166,8 @@ def build_future_raw_rows(
                 numeric_shift_limits[col] = 0.0
                 continue
 
-            numeric_baselines[col] = float(recent.median())
+            last_value = pd.to_numeric(pd.Series([last_row[col]]), errors="coerce").iloc[0]
+            numeric_baselines[col] = float(last_value) if pd.notna(last_value) else float(recent.median())
             numeric_trends[col] = estimate_recent_trend(machine_df[col], trend_window)
             std = float(recent.std()) if len(recent) > 1 else 0.0
             q25 = float(recent.quantile(0.25))
@@ -133,34 +177,48 @@ def build_future_raw_rows(
 
         for step in range(1, steps + 1):
             future_timestamp = last_timestamp + pd.Timedelta(minutes=step * step_minutes)
+            forecast_elapsed_hours = step * step_hours
             row: dict[str, Any] = {
                 "timestamp": future_timestamp,
                 "machine_id": machine_id,
                 "is_future": True,
                 "forecast_step": step,
-                "forecast_horizon_hours": step * step_hours,
+                "forecast_horizon_hours": forecast_elapsed_hours,
+                "forecast_elapsed_hours": forecast_elapsed_hours,
+                "mode_drift_factor": mode_drift_factor,
             }
 
             for col in categorical_cols:
                 if col in machine_df.columns:
-                    row[col] = last_row[col]
+                    row[col] = projected_mode if col == "operating_mode" else last_row[col]
 
             for col in numeric_cols:
                 if col not in machine_df.columns:
                     continue
 
                 if col == "hours_since_maintenance":
-                    value = float(last_row[col]) + step * step_hours
+                    value = float(last_row[col]) + forecast_elapsed_hours
                 else:
                     baseline = numeric_baselines.get(col, np.nan)
                     if pd.isna(baseline):
                         baseline = float(last_row[col]) if pd.notna(last_row[col]) else float(machine_df[col].median())
 
                     value = baseline
+                    mode_shift = (
+                        get_mode_delta(mode_delta_profiles, projected_mode, col)
+                        * step
+                        * mode_drift_strength
+                        * mode_drift_factor
+                    )
+                    raw_shift = mode_shift
                     if scenario == "damped_trend":
-                        raw_shift = numeric_trends[col] * step * trend_strength
-                        shift_limit = numeric_shift_limits.get(col, 0.0)
-                        value = baseline + float(np.clip(raw_shift, -shift_limit, shift_limit))
+                        raw_shift += numeric_trends[col] * step * trend_strength * mode_drift_factor
+
+                    lower, upper = clip_bounds.get(col, (-np.inf, np.inf))
+                    local_limit = numeric_shift_limits.get(col, 0.0)
+                    global_limit = (upper - lower) * 0.35 if np.isfinite(upper - lower) else local_limit
+                    shift_limit = max(local_limit, global_limit, 1e-9)
+                    value = baseline + float(np.clip(raw_shift, -shift_limit, shift_limit))
 
                 lower, upper = clip_bounds.get(col, (-np.inf, np.inf))
                 row[col] = float(np.clip(value, lower, upper))
@@ -168,6 +226,79 @@ def build_future_raw_rows(
             rows.append(row)
 
     return pd.DataFrame(rows)
+
+
+def build_mode_delta_profiles(
+    history_df: pd.DataFrame,
+    numeric_cols: list[str],
+) -> dict[str, dict[str, float]]:
+    if "operating_mode" not in history_df.columns or "machine_id" not in history_df.columns:
+        return {}
+
+    ordered = history_df.sort_values(["machine_id", "timestamp"]).copy()
+    profiles: dict[str, dict[str, float]] = {}
+    for col in numeric_cols:
+        if col == "hours_since_maintenance" or col not in ordered.columns:
+            continue
+
+        deltas = pd.to_numeric(ordered[col], errors="coerce").groupby(ordered["machine_id"]).diff()
+        mode_delta = (
+            pd.DataFrame(
+                {
+                    "operating_mode": ordered["operating_mode"].astype(str).str.lower(),
+                    "delta": deltas,
+                }
+            )
+            .dropna(subset=["delta"])
+            .groupby("operating_mode")["delta"]
+            .median()
+        )
+        for mode, delta in mode_delta.items():
+            profiles.setdefault(str(mode), {})[col] = float(delta)
+
+    return profiles
+
+
+def get_mode_delta(
+    mode_delta_profiles: dict[str, dict[str, float]],
+    mode_value: Any,
+    column: str,
+) -> float:
+    mode = str(mode_value).strip().lower()
+    for key, profile in mode_delta_profiles.items():
+        if key in mode:
+            return profile.get(column, 0.0)
+    return 0.0
+
+
+def apply_mode_risk_adjustment(
+    future_df: pd.DataFrame,
+    current_risk_by_machine: dict[Any, float],
+) -> pd.Series:
+    adjusted = []
+    for _, row in future_df.iterrows():
+        raw_risk = float(row.get("model_risk_probability", row.get("risk_probability", 0.0)))
+        current_risk = float(current_risk_by_machine.get(row.get("machine_id"), raw_risk))
+        mode = str(row.get("operating_mode", "normal")).strip().lower()
+
+        if "idle" in mode:
+            risk = min(raw_risk, current_risk + IDLE_MAX_RISK_INCREASE)
+        elif "peak" in mode:
+            risk = min(raw_risk * PEAK_RISK_MULTIPLIER, 1.0)
+        else:
+            risk = raw_risk
+
+        adjusted.append(float(np.clip(risk, 0.0, 1.0)))
+
+    return pd.Series(adjusted, index=future_df.index)
+
+
+def get_mode_sensor_drift_factor(mode_value: Any) -> float:
+    mode = str(mode_value).strip().lower()
+    for key, factor in MODE_SENSOR_DRIFT_FACTORS.items():
+        if key in mode:
+            return factor
+    return 1.0
 
 
 def estimate_recent_trend(series: pd.Series, trend_window: int) -> float:

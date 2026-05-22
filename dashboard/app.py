@@ -19,8 +19,10 @@ from src.config import (  # noqa: E402
     DEFAULT_DATA_PATH,
     DEFAULT_TARGET,
     FEATURE_IMPORTANCE_PATH,
+    LAG_STEPS,
     METRICS_CSV_PATH,
     REPORTS_DIR,
+    TARGET_HORIZON_HOURS,
 )
 from src.data import add_temporal_features, load_dataset  # noqa: E402
 from src.forecast import forecast_future_failures  # noqa: E402
@@ -169,6 +171,32 @@ def add_model_predictions(engineered_df: pd.DataFrame, artifact: dict[str, Any])
     return df
 
 
+def build_simulated_history(
+    raw_df: pd.DataFrame,
+    machine_id: Any,
+    payload: dict[str, Any],
+    adjustable_features: list[str],
+) -> pd.DataFrame:
+    if "machine_id" not in raw_df.columns or "timestamp" not in raw_df.columns:
+        return pd.DataFrame()
+
+    history = raw_df[raw_df["machine_id"] == machine_id].copy()
+    if history.empty:
+        return history
+
+    history["timestamp"] = pd.to_datetime(history["timestamp"], errors="coerce")
+    history = history.dropna(subset=["timestamp"]).sort_values("timestamp")
+    if history.empty:
+        return history
+
+    last_index = history.index[-1]
+    for col in adjustable_features + ["operating_mode"]:
+        if col in history.columns and col in payload:
+            history.loc[last_index, col] = payload[col]
+
+    return history
+
+
 def latest_machine_state(scored_df: pd.DataFrame) -> pd.DataFrame:
     if "timestamp" in scored_df.columns:
         ordered = scored_df.sort_values(["machine_id", "timestamp"])
@@ -193,13 +221,16 @@ def summarize_future_risk(
         return pd.DataFrame()
 
     grouped = future_df.groupby("machine_id", as_index=False)
-    summary = grouped.agg(
-        max_future_risk=("risk_smoothed", "max"),
-        peak_raw_risk=("risk_probability", "max"),
-        future_points=("timestamp", "count"),
-        alert_points=("persistent_alert", "sum"),
-        last_future_timestamp=("timestamp", "max"),
-    )
+    agg_map = {
+        "max_future_risk": ("risk_smoothed", "max"),
+        "peak_raw_risk": ("risk_probability", "max"),
+        "future_points": ("timestamp", "count"),
+        "alert_points": ("persistent_alert", "sum"),
+        "last_future_timestamp": ("timestamp", "max"),
+    }
+    if "mode_drift_factor" in future_df.columns:
+        agg_map["mode_drift_factor"] = ("mode_drift_factor", "max")
+    summary = grouped.agg(**agg_map)
 
     alert_rows = future_df[future_df["persistent_alert"]].sort_values(["machine_id", "timestamp"])
     first_alert = alert_rows.groupby("machine_id")["timestamp"].min().rename("first_alert_at")
@@ -533,14 +564,27 @@ with forecast_tab:
         "<div class='section-note'>Projection court terme par machine : on stabilise les derniers signaux capteurs, on recalcule les lags, puis on applique le modele et la regle de persistance.</div>",
         unsafe_allow_html=True,
     )
+    lag_minutes = [int(round((sampling_minutes or 0) * lag)) for lag in LAG_STEPS]
+    st.caption(
+        f"Limite modele : la cible est {DEFAULT_TARGET}, donc l'horizon maximum coherent est {TARGET_HORIZON_HOURS}h. "
+        f"Avec la cadence mediane du dataset, les lags {LAG_STEPS} couvrent environ {lag_minutes} minutes."
+    )
+    st.caption("Regle de projection : la duree reste identique pour tous les modes. Idle stabilise les capteurs, normal applique la derive moyenne, peak accelere les deltas capteurs estimes depuis predictive_maintenance_v3.csv.")
 
     default_step = int(round(sampling_minutes or 15))
     step_options = sorted({5, 10, 15, 30, 60, default_step})
     default_step_index = step_options.index(default_step) if default_step in step_options else 0
 
-    f1, f2, f3, f4 = st.columns(4)
+    f1, f2, f3 = st.columns(3)
     with f1:
-        horizon_hours = st.slider("Horizon futur", 1, 72, 24, 1, help="Nombre d'heures a projeter apres la derniere mesure.")
+        horizon_hours = st.slider(
+            "Horizon futur",
+            1,
+            TARGET_HORIZON_HOURS,
+            TARGET_HORIZON_HOURS,
+            1,
+            help="Le modele a ete entraine pour predire failure_within_24h. Au-dela de 24h, il faut creer une nouvelle cible.",
+        )
     with f2:
         forecast_step_minutes = st.selectbox(
             "Pas de projection",
@@ -558,15 +602,25 @@ with forecast_tab:
             1,
             help="Nombre de dernieres mesures utilisees comme etat recent de la machine.",
         )
+
+    f4, f5 = st.columns(2)
     with f4:
         scenario_label = st.selectbox(
             "Scenario capteurs",
-            ["Etat recent stable", "Tendance amortie"],
+            ["Etat recent + mode", "Tendance amortie"],
             index=0,
-            help="Stable evite d'inventer une derive capteur. Tendance amortie prolonge doucement la tendance recente.",
+            help="Etat recent + mode applique la derive capteur moyenne du mode. Tendance amortie ajoute aussi la tendance recente de la machine.",
         )
-    forecast_scenario = "stable_recent" if scenario_label == "Etat recent stable" else "damped_trend"
+    with f5:
+        future_mode_label = st.selectbox(
+            "Mode futur",
+            ["Mode courant", "idle", "normal", "peak"],
+            index=0,
+            help="Mode courant garde le dernier mode observe de chaque machine. Les autres choix forcent un scenario metier.",
+        )
+    forecast_scenario = "stable_recent" if scenario_label == "Etat recent + mode" else "damped_trend"
     trend_strength = 0.0 if forecast_scenario == "stable_recent" else 0.15
+    future_mode = None if future_mode_label == "Mode courant" else future_mode_label
 
     try:
         future_df = forecast_future_failures(
@@ -577,6 +631,7 @@ with forecast_tab:
             trend_window=trend_window,
             scenario=forecast_scenario,
             trend_strength=trend_strength,
+            future_mode=future_mode,
         )
         combined_forecast = pd.concat(
             [scored_df.assign(is_future=False), future_df],
@@ -622,6 +677,7 @@ with forecast_tab:
                 "machine_id",
                 "machine_type",
                 "operating_mode",
+                "mode_drift_factor",
                 "action",
                 "current_risk",
                 "max_future_risk",
@@ -638,6 +694,8 @@ with forecast_tab:
                 display_summary[col] = (display_summary[col] * 100).round(1)
         if "hours_until_alert" in display_summary.columns:
             display_summary["hours_until_alert"] = display_summary["hours_until_alert"].round(2)
+        if "mode_drift_factor" in display_summary.columns:
+            display_summary["mode_drift_factor"] = display_summary["mode_drift_factor"].round(2)
 
         st.dataframe(
             display_summary,
@@ -865,7 +923,7 @@ with data_tab:
 with simulation_tab:
     st.subheader("Simulation d'un scenario")
     st.markdown(
-        "<div class='section-note'>La simulation part du dernier etat reel d'une machine. Les lags restent coherents avec son historique, et tu modifies seulement les signaux courants.</div>",
+        "<div class='section-note'>La simulation part du dernier etat reel d'une machine. Elle calcule le risque instantane puis projette un risque futur en tenant compte du mode d'exploitation.</div>",
         unsafe_allow_html=True,
     )
 
@@ -905,6 +963,15 @@ with simulation_tab:
                 index=modes.index(current_mode) if current_mode in modes else 0,
             )
 
+        sim_horizon_hours = st.slider(
+            "Duree du scenario",
+            1,
+            TARGET_HORIZON_HOURS,
+            TARGET_HORIZON_HOURS,
+            1,
+            help="Limite a 24h car le modele predit failure_within_24h. Pour 48h ou 72h, il faut entrainer une cible adaptee.",
+        )
+
         if st.button("Calculer le risque", type="primary"):
             prediction = predict_one(payload, artifact)
             risk = float(prediction.get("probability_failure", prediction["prediction"]))
@@ -914,7 +981,72 @@ with simulation_tab:
                 f"<span class='status-pill {css_class}'>{label} - risque instantane {risk * 100:.1f}%</span>",
                 unsafe_allow_html=True,
             )
-            st.caption(
-                "La simulation donne un risque instantane. En production, il faudrait plusieurs mesures consecutives elevees pour declencher une alerte critique."
-            )
-            st.json(prediction)
+            st.caption("Risque instantane : meme etat capteur, meme lags, seul le mode selectionne est passe au modele.")
+
+            if "operating_mode" in payload:
+                simulated_history = build_simulated_history(
+                    df,
+                    selected_machine,
+                    payload,
+                    adjustable_features,
+                )
+                if simulated_history.empty:
+                    st.warning("Projection future impossible pour cette machine: historique timestamp introuvable.")
+                else:
+                    future_sim = forecast_future_failures(
+                        simulated_history,
+                        artifact,
+                        horizon_hours=sim_horizon_hours,
+                        step_minutes=int(round(sampling_minutes or 15)),
+                        trend_window=12,
+                        scenario="stable_recent",
+                        future_mode=str(payload["operating_mode"]),
+                    )
+                    future_sim = add_persistent_risk_alerts(
+                        future_sim,
+                        threshold=risk_threshold,
+                        smoothing_window=smoothing_window,
+                        persistence_points=persistence_points,
+                    )
+
+                    future_max_risk = float(future_sim["risk_smoothed"].max()) if len(future_sim) else risk
+                    future_end_risk = float(future_sim["risk_smoothed"].iloc[-1]) if len(future_sim) else risk
+                    future_alert = bool(future_sim["persistent_alert"].any()) if len(future_sim) else False
+                    mode_drift_factor = float(future_sim["mode_drift_factor"].iloc[-1]) if "mode_drift_factor" in future_sim else 1.0
+                    projected_hours = (
+                        float(future_sim["forecast_elapsed_hours"].iloc[-1])
+                        if "forecast_elapsed_hours" in future_sim
+                        else float(sim_horizon_hours)
+                    )
+
+                    s1, s2, s3, s4 = st.columns(4)
+                    s1.metric("Mode simule", str(payload["operating_mode"]))
+                    s2.metric("Facteur capteurs", f"x{mode_drift_factor:.2f}")
+                    s3.metric("Duree projetee", f"{projected_hours:.1f} h")
+                    s4.metric("Risque futur max", pct(future_max_risk))
+
+                    future_label = "Critique" if future_alert else risk_label(future_max_risk, risk_threshold)
+                    future_class = "pill-risk" if future_alert else risk_class(future_max_risk, risk_threshold)
+                    st.markdown(
+                        f"<span class='status-pill {future_class}'>{future_label} - risque futur fin scenario {future_end_risk * 100:.1f}%</span>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        "Projection mode-aware : la duree reste la meme. Idle garde les capteurs quasi stables, normal applique la derive moyenne, peak accelere les deltas capteurs estimes depuis le dataset."
+                    )
+
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(
+                            x=future_sim["timestamp"],
+                            y=future_sim["risk_smoothed"],
+                            name="Risque futur lisse",
+                            line=dict(color=COLOR_RISK, width=3),
+                        )
+                    )
+                    fig.add_hline(y=risk_threshold, line_dash="dash", line_color=COLOR_WARN, annotation_text="Seuil")
+                    fig.update_layout(yaxis_tickformat=".0%", height=280, margin=dict(l=10, r=10, t=20, b=10))
+                    st.plotly_chart(fig, width="stretch")
+
+            with st.expander("Details prediction instantanee"):
+                st.json(prediction)

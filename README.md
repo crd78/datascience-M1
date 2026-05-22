@@ -98,10 +98,10 @@ automatiquement des features temporelles :
 - `timestamp_hour`
 - `timestamp_dayofweek`
 - `timestamp_hours_since_machine_start`
-- `vibration_rms_lag_1`, `vibration_rms_lag_3`
-- `temperature_motor_lag_1`, `current_phase_avg_lag_1`, `pressure_level_lag_1`, etc.
+- `vibration_rms_lag_1`, `vibration_rms_lag_3`, `vibration_rms_lag_6`, `vibration_rms_lag_12`
+- `temperature_motor_lag_1`, `current_phase_avg_lag_6`, `pressure_level_lag_12`, etc.
 - deltas comme `vibration_rms_delta_1`
-- moyennes glissantes comme `vibration_rms_rolling_3_mean`
+- moyennes glissantes comme `vibration_rms_rolling_3_mean` et `vibration_rms_rolling_6_mean`
 
 Le split train/test devient chronologique quand `timestamp` existe, afin d'eviter de tester
 sur le passe avec un modele entraine sur le futur.
